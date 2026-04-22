@@ -1,84 +1,57 @@
-import certifi
-import polars as pl
+"""
+Acquisition des donnees brutes
+================================
+Lit  : InfluxDB MeteoSuisse + Data_Oiken.csv
+Ecrit: data/oiken_raw.parquet
+       data/meteo_{station}_hist_raw.parquet
+       data/meteo_{station}_pred_raw.parquet
+
+Aucune transformation des donnees — sauvegarde brute.
+"""
+
 from pathlib import Path
+import polars as pl
+import certifi
 from influxdb_client import InfluxDBClient
+from datetime import timedelta
 
-#Configuration globale pour la recherche de donnée sur l'API
+from config import (
+    URL, TOKEN, ORG, BUCKET,
+    START, STOP,
+    STATIONS, HISTORICAL, PRED_VARS, SUBTYPES, RUNS,
+    DATA_DIR,
+    FILE_OIKEN_RAW,
+    FILE_METEO_HIST_RAW,
+    FILE_METEO_PRED_RAW,
+)
 
-URL    = "https://timeseries.hevs.ch"
-ORG    = "HESSOVS"
-BUCKET = "MeteoSuisse"
-TOKEN  = "ixOI8jiwG1nn6a2MaE1pGa8XCiIJ2rqEX6ZCnluhwAyeZcrT6FHoDgnQhNy5k0YmVrk7hZGPpvb_5aaA-ZxhIw=="
-
-START = "2022-10-01T00:00:00Z"
-STOP  = "2025-10-01T00:00:00Z"
-
-OUTPUT_DIR = Path("data")
-
-RUNS = [f"{i:02d}" for i in range(1, 34)]
-
-STATIONS = {
-    "Sion":               "sion",
-    "Visp":               "visp",
-    "Montagnier, Bagnes": "montagnier_bagnes",
-    "Montana":            "crans_montana",
-    "Simplon-Dorf":       "simplon_dorf",
-    "Les Marécottes":     "les_marecottes",
-    "Evionnaz":           "evionnaz",
-}
-
-HISTORICAL = {
-    "Air temperature 2m above ground (current value)":       "hist_temperature",
-    "Global radiation (ten minutes mean)":                   "hist_radiation",
-    "Sunshine duration (ten minutes total)":                 "hist_sunshine",
-    "Precipitation (ten minutes total)":                     "hist_precipitation",
-    "Relative air humidity 2m above ground (current value)": "hist_humidity",
-    "Atmospheric pressure at barometric altitude":           "hist_pressure",
-    "Wind speed scalar (ten minutes mean)":                  "hist_wind_speed",
-    "Wind Direction (ten minutes mean)":                     "hist_wind_dir",
-    "Gust peak (one second) (maximum)":                      "hist_gust",
-}
-
-PRED_VARS = {
-    "PRED_GLOB":      "pred_radiation",
-    "PRED_DURSUN":    "pred_sunshine",
-    "PRED_T_2M":      "pred_temperature",
-    "PRED_TOT_PREC":  "pred_precipitation",
-    "PRED_RELHUM_2M": "pred_humidity",
-    "PRED_PS":        "pred_pressure",
-    "PRED_FF_10M":    "pred_wind_speed",
-    "PRED_DD_10M":    "pred_wind_dir",
-}
-SUBTYPES = ["ctrl", "q10", "q90", "stde"]
-
-#Connexion à InfluxDB
-
+# ════════════════════════════════════════════════════════════════════════════
+# HELPERS INFLUXDB
+# ════════════════════════════════════════════════════════════════════════════
 def make_client() -> InfluxDBClient:
     return InfluxDBClient(
         url=URL, token=TOKEN, org=ORG,
         ssl_ca_cert=certifi.where(),
-        timeout=1_000_000
+        timeout=1_000_000,
     )
 
-#Construction de la requête en language Flux
 
 def build_query(measurement: str, site: str, run_filter: str = "") -> str:
     q = (
-        'from(bucket: "' + BUCKET + '")'
-        + ' |> range(start: ' + START + ', stop: ' + STOP + ')'
-        + ' |> filter(fn: (r) => r["_measurement"] == "' + measurement + '")'
-        + ' |> filter(fn: (r) => r["Site"] == "' + site + '")'
+        f'from(bucket: "{BUCKET}")'
+        f' |> range(start: {START}, stop: {STOP})'
+        f' |> filter(fn: (r) => r["_measurement"] == "{measurement}")'
+        f' |> filter(fn: (r) => r["Site"] == "{site}")'
     )
     if run_filter:
-        q += ' |> filter(fn: (r) => ' + run_filter + ')'
+        q += f' |> filter(fn: (r) => {run_filter})'
     q += ' |> keep(columns: ["_time", "_value", "Prediction"])'
     return q
 
-#Execution de la requête en language Flux
 
 def query_to_df(api, measurement: str, site: str,
                 col_name: str, run_filter: str = "") -> pl.DataFrame:
-    q = build_query(measurement, site, run_filter)
+    q      = build_query(measurement, site, run_filter)
     tables = api.query(org=ORG, query=q)
 
     times, values, preds = [], [], []
@@ -98,107 +71,23 @@ def query_to_df(api, measurement: str, site: str,
     return pl.DataFrame({
         "timestamp": pl.Series(times).cast(pl.Datetime("us", "UTC")),
         col_name:    pl.Series(values, dtype=pl.Float64),
-        "run_id":    pl.Series(preds, dtype=pl.Utf8),
+        "run_id":    pl.Series(preds,  dtype=pl.Utf8),
     })
 
-#Acquisition des données historique
 
-def acquire_historical(api, site: str) -> pl.DataFrame:
-    dfs = []
-    for measurement, col_name in HISTORICAL.items():
-        df = query_to_df(api, measurement, site, col_name)
-        if df.shape[0] == 0:
-            continue
-        dfs.append(df.drop("run_id"))
+# ════════════════════════════════════════════════════════════════════════════
+# ACQUISITION OIKEN
+# ════════════════════════════════════════════════════════════════════════════
+def acquire_oiken(csv_path: str = "Data_Oiken.csv") -> None:
+    """
+    Charge le CSV Oiken et sauvegarde en Parquet brut.
+    Seul le parsing du timestamp et le renommage des colonnes sont effectues.
+    Aucune correction de valeurs.
+    """
+    print("\n" + "="*65)
+    print("  OIKEN")
+    print("="*65)
 
-    if not dfs:
-        return pl.DataFrame()
-
-    merged = dfs[0]
-    for df in dfs[1:]:
-        merged = merged.join(df, on="timestamp", how="full", coalesce=True)
-    return merged.sort("timestamp")
-
-#Acquisition des données de prédiction
-
-def acquire_predictions_wide(api, site: str) -> pl.DataFrame:
-    runs_filter = " or ".join([f'r["Prediction"] == "{r}"' for r in RUNS])
-
-    long_data: dict[tuple, dict[str, float]] = {}
-
-#Collecte les données en format long
-    for var_key, col_base in PRED_VARS.items():
-        for subtype in SUBTYPES:
-            measurement = f"{var_key}_{subtype}"
-            df = query_to_df(api, measurement, site,
-                             col_name=f"{col_base}_{subtype}",
-                             run_filter=runs_filter)
-            if df.shape[0] == 0:
-                continue
-
-            col = f"{col_base}_{subtype}"
-            for row in df.iter_rows(named=True):
-                key = (row["timestamp"], row["run_id"])
-                if key not in long_data:
-                    long_data[key] = {}
-                long_data[key][col] = row[col]
-
-    if not long_data:
-        return pl.DataFrame()
-    
-    #Construction du DataFrame
-    all_wide_cols = [
-        f"{col_base}_{subtype}_run{run}"
-        for col_base in PRED_VARS.values()
-        for subtype in SUBTYPES
-        for run in RUNS
-    ]
-    #Pivote au format wide
-    wide_data: dict = {}
-    for (ts, run_id), values in long_data.items():
-        if ts not in wide_data:
-            wide_data[ts] = {}
-        for col, val in values.items():
-            wide_col = f"{col}_run{run_id}"
-            wide_data[ts][wide_col] = val
-
-    timestamps = sorted(wide_data.keys())
-    records = []
-    for ts in timestamps:
-        row = {"timestamp_target": ts}
-        for col in all_wide_cols:
-            row[col] = wide_data[ts].get(col, None)
-        records.append(row)
-
-    schema = {"timestamp_target": pl.Datetime("us", "UTC")}
-    for col in all_wide_cols:
-        schema[col] = pl.Float64
-
-    return pl.DataFrame(records, schema=schema).sort("timestamp_target")
-
-#Acquisition générale météo par site
-def process_site(api, site: str, file_name: str):
-    df_hist = acquire_historical(api, site)
-    df_pred = acquire_predictions_wide(api, site)
-
-    path = OUTPUT_DIR / f"meteo_{file_name}.parquet"
-
-    if df_hist.is_empty() and df_pred.is_empty():
-        return
-
-    if not df_hist.is_empty() and not df_pred.is_empty():
-        df_pred_renamed = df_pred.rename({"timestamp_target": "timestamp"})
-        merged = df_hist.join(df_pred_renamed, on="timestamp", how="full", coalesce=True)
-        merged = merged.sort("timestamp")
-    elif not df_hist.is_empty():
-        merged = df_hist
-    else:
-        merged = df_pred.rename({"timestamp_target": "timestamp"})
-
-    merged.write_parquet(path)
-
-#Acquisition des données de Oiken
-def process_oiken(csv_path: str = "Data_Oiken.csv"):
     df = pl.read_csv(
         csv_path,
         separator=",",
@@ -213,71 +102,202 @@ def process_oiken(csv_path: str = "Data_Oiken.csv"):
             "remote solar production [kWh]":         pl.Float64,
         }
     )
-    #Passage au format UTC
+
     df = df.with_columns(
         pl.col("timestamp")
           .str.strptime(pl.Datetime("us"), "%d/%m/%Y %H:%M")
           .dt.replace_time_zone("UTC")
           .alias("timestamp")
-    )
-    #Renomination des colonnes
-    df = df.rename({
+    ).rename({
         "standardised load [-]":                 "load",
         "standardised forecast load [-]":        "forecast_load",
         "central valais solar production [kWh]": "pv_central_valais",
         "sion area solar production [kWh]":      "pv_sion",
         "sierre area production [kWh]":          "pv_sierre",
-        "remote solar production [kWh]":         "pv_remote_raw",
-    })
+        "remote solar production [kWh]":         "pv_remote",
+    }).sort("timestamp")
 
-    #Supression de l'offset min du PV remote
-    night_min = (df
-        .filter(df["timestamp"].dt.hour() < 4)["pv_remote_raw"]
-        .min())
+    df.write_parquet(FILE_OIKEN_RAW)
+    size_mb = FILE_OIKEN_RAW.stat().st_size / 1024 / 1024
+    print(f"  {FILE_OIKEN_RAW.name}  "
+          f"({df.shape[0]:,} lignes x {df.shape[1]} col, {size_mb:.1f} MB)")
+    print(f"  Periode : {df['timestamp'].min()} -> {df['timestamp'].max()}")
 
-    df = df.with_columns(
-        (pl.col("pv_remote_raw") - night_min)
-          .clip(lower_bound=0)
-          .alias("pv_remote")
-    ).drop("pv_remote_raw")
 
-    df = df.with_columns(
-        (pl.col("pv_central_valais") + pl.col("pv_sion") +
-         pl.col("pv_sierre")         + pl.col("pv_remote"))
-          .alias("pv_total")
-    )
+# ════════════════════════════════════════════════════════════════════════════
+# ACQUISITION HISTORIQUE
+# ════════════════════════════════════════════════════════════════════════════
+def acquire_historical(api, site: str, file_name: str) -> None:
+    """
+    Telecharge les donnees historiques d'une station et sauvegarde en Parquet.
+    Format : une ligne par timestamp, une colonne par variable.
+    """
+    print(f"\n  [HIST] {site}")
 
-    df = df.sort("timestamp")
-    path = OUTPUT_DIR / "oiken.parquet"
-    df.write_parquet(path)
+    dfs = []
+    for measurement, col_name in HISTORICAL.items():
+        df = query_to_df(api, measurement, site, col_name)
+        n  = df.shape[0]
+        print(f"    {col_name:<28} {n:>9,} points")
 
-#Bouclage des données sur toutes les stations
+        if n == 0:
+            continue
 
-def main():
-    OUTPUT_DIR.mkdir(exist_ok=True)
+        dfs.append(df.drop("run_id"))
 
-    process_oiken("Data_Oiken.csv")
+    if not dfs:
+        print(f"    Aucune donnee pour {site} — fichier non cree")
+        return
 
+    merged = dfs[0]
+    for df in dfs[1:]:
+        merged = merged.join(df, on="timestamp", how="full", coalesce=True)
+    merged = merged.sort("timestamp")
+
+    path = FILE_METEO_HIST_RAW(file_name)
+    merged.write_parquet(path)
+    size_mb = path.stat().st_size / 1024 / 1024
+    print(f"    -> {path.name}  "
+          f"({merged.shape[0]:,} lignes x {merged.shape[1]} col, {size_mb:.1f} MB)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ACQUISITION PREDICTIONS
+# ════════════════════════════════════════════════════════════════════════════
+def acquire_predictions(api, site: str, file_name: str) -> None:
+    """
+    Telecharge les predictions d'une station et sauvegarde en Parquet.
+
+    Format long d'abord : (timestamp_emission, timestamp_target, run_id, variable, valeur)
+    Puis pivot vers format wide :
+      une ligne par (timestamp_emission, timestamp_target)
+      une colonne par (variable_subtype_runXX)
+
+    timestamp_emission : quand la prediction a ete emise (toutes les 3h)
+    timestamp_target   : l'heure predite
+    """
+    print(f"\n  [PRED] {site}")
+
+    runs_filter = " or ".join([f'r["Prediction"] == "{r}"' for r in RUNS])
+
+    # Collecte en format long :
+    # {(timestamp_emission, timestamp_target, run_id) -> {col: value}}
+    # Dans InfluxDB :
+    #   _time      = timestamp_target  (l'heure predite)
+    #   Prediction = run_id
+    # Le timestamp d'emission est deduit : emission = target - run_id * 1h
+    # (le run 01 predit dans 1h, le run 02 dans 2h, etc.)
+    long_data: dict[tuple, dict[str, float]] = {}
+
+    for var_key, col_base in PRED_VARS.items():
+        for subtype in SUBTYPES:
+            measurement = f"{var_key}_{subtype}"
+            col         = f"{col_base}_{subtype}"
+            print(f"    {col:<35} ...", end=" ", flush=True)
+
+            df = query_to_df(api, measurement, site,
+                             col_name=col,
+                             run_filter=runs_filter)
+            n = df.shape[0]
+            print(f"{n:>9,} points")
+
+            if n == 0:
+                continue
+
+            for row in df.iter_rows(named=True):
+                ts_target = row["timestamp"]
+                run_id    = row["run_id"]
+
+                # Calculer le timestamp d'emission :
+                # run_id "01" -> target - 1h, "02" -> target - 2h, etc.
+                run_num   = int(run_id)
+                ts_emit = ts_target - timedelta(hours=run_num)
+
+                key = (ts_emit, ts_target, run_id)
+                if key not in long_data:
+                    long_data[key] = {}
+                long_data[key][col] = row[col]
+
+    if not long_data:
+        print(f"    Aucune donnee pour {site} — fichier non cree")
+        return
+
+    # Construire toutes les colonnes wide attendues
+    all_wide_cols = [
+        f"{col_base}_{subtype}_run{run}"
+        for col_base in PRED_VARS.values()
+        for subtype   in SUBTYPES
+        for run       in RUNS
+    ]
+
+    # Pivot : une ligne par (ts_emit, ts_target)
+    wide_data: dict[tuple, dict[str, float]] = {}
+    for (ts_emit, ts_target, run_id), values in long_data.items():
+        key = (ts_emit, ts_target)
+        if key not in wide_data:
+            wide_data[key] = {}
+        for col, val in values.items():
+            wide_col = f"{col}_run{run_id}"
+            wide_data[key][wide_col] = val
+
+    # Construire le DataFrame
+    keys      = sorted(wide_data.keys())
+    records   = []
+    for ts_emit, ts_target in keys:
+        row = {
+            "timestamp_emission": ts_emit,
+            "timestamp_target":   ts_target,
+        }
+        for col in all_wide_cols:
+            row[col] = wide_data[(ts_emit, ts_target)].get(col, None)
+        records.append(row)
+
+    schema = {
+        "timestamp_emission": pl.Datetime("us", "UTC"),
+        "timestamp_target":   pl.Datetime("us", "UTC"),
+    }
+    for col in all_wide_cols:
+        schema[col] = pl.Float64
+
+    df_wide = pl.DataFrame(records, schema=schema)
+    df_wide = df_wide.sort(["timestamp_emission", "timestamp_target"])
+
+    path = FILE_METEO_PRED_RAW(file_name)
+    df_wide.write_parquet(path)
+    size_mb = path.stat().st_size / 1024 / 1024
+    print(f"\n    -> {path.name}  "
+          f"({df_wide.shape[0]:,} lignes x {df_wide.shape[1]} col, {size_mb:.1f} MB)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    DATA_DIR.mkdir(exist_ok=True)
+
+    # ── Oiken ─────────────────────────────────────────────────────────────
+    acquire_oiken("Data_Oiken.csv")
+
+    # ── MeteoSuisse ───────────────────────────────────────────────────────
+    print("\nConnexion a InfluxDB...")
     client = make_client()
     api    = client.query_api()
 
-    available = [r["_value"]
-                 for t in client.query_api().query(
-                     org=ORG,
-                     query='import "influxdata/influxdb/schema"\nschema.tagValues(bucket: "' + BUCKET + '", tag: "Site")'
-                 )
-                 for r in t.records]
-
     for site, file_name in STATIONS.items():
-        if site not in available:
-            matches = [s for s in available if site.split(",")[0].strip().lower() in s.lower()]
-            if matches:
-                site = matches[0]
-            else:
-                continue
-        process_site(api, site, file_name)
+        print(f"\n{'='*65}")
+        print(f"  Station : {site}")
+        print(f"{'='*65}")
+        acquire_historical(api, site, file_name)
+        acquire_predictions(api, site, file_name)
 
     client.close()
 
-if __name__ == "__main__":
-    main()
+    # ── Resume ────────────────────────────────────────────────────────────
+    print(f"\n{'='*65}")
+    print("FICHIERS GENERES")
+    print(f"{'='*65}")
+    for p in sorted(DATA_DIR.glob("*_raw.parquet")):
+        df      = pl.read_parquet(p)
+        size_mb = p.stat().st_size / 1024 / 1024
+        print(f"  {p.name:<50} {df.shape[0]:>9,} lignes  "
+              f"{df.shape[1]:>5} col  {size_mb:>6.1f} MB")

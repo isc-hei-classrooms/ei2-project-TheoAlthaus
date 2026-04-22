@@ -1,14 +1,38 @@
+"""
+Generation du calendrier
+==========================
+Ecrit: data/calendar.parquet
+
+Colonnes :
+  timestamp           datetime UTC 15min
+  hour                0-23 (heure locale Europe/Zurich)
+  day_of_week         0=lundi 6=dimanche (heure locale)
+  month               1-12 (heure locale)
+  is_weekend          0/1
+  is_holiday          0/1  jours feries Valais
+  is_school_holiday   0/1  vacances scolaires Sion
+  hour_sin/cos        encodage cyclique heure
+  day_of_year_sin/cos encodage cyclique jour de l'annee
+  month_sin/cos       encodage cyclique mois
+  day_of_week_sin/cos encodage cyclique jour semaine
+"""
+
 import math
-from datetime import datetime, date, timedelta, timezone
-from pathlib import Path
+from datetime import date, timedelta
+from zoneinfo import ZoneInfo
+
 import polars as pl
 
-OUTPUT_DIR = Path("data")
-OUTPUT_DIR.mkdir(exist_ok=True)
+from config import DATA_DIR, FILE_CALENDAR, TARGET_STEP_MIN
 
-# Recherche de Pâques avec l'algorithme de Meeus
+PERIOD_START = pl.datetime(2022, 10,  1,  0, 15, 0, time_unit="us", time_zone="UTC")
+PERIOD_END   = pl.datetime(2025,  9, 30,  0,  0, 0, time_unit="us", time_zone="UTC")
 
-def easter(year):
+TZ_LOCAL = ZoneInfo("Europe/Zurich")
+
+
+# ── Jours feries valaisans ────────────────────────────────────────────────────
+def easter(year: int) -> date:
     a = year % 19
     b = year // 100
     c = year % 100
@@ -25,9 +49,8 @@ def easter(year):
     day   = ((h + l - 7 * m + 114) % 31) + 1
     return date(year, month, day)
 
-#Recherche des jour fériés en Valais à partir de Pâques
 
-def get_holidays_valais(year):
+def get_holidays_valais(year: int) -> set:
     e = easter(year)
     return {
         date(year,  1,  1),
@@ -46,8 +69,8 @@ def get_holidays_valais(year):
         e + timedelta(days=60),
     }
 
-#Vacances scolaires de la période observées
 
+# ── Vacances scolaires Sion ───────────────────────────────────────────────────
 SCHOOL_HOLIDAYS = [
     (date(2022,  4,  9), date(2022,  4, 24)),
     (date(2022,  6, 30), date(2022,  8, 14)),
@@ -68,9 +91,8 @@ SCHOOL_HOLIDAYS = [
     (date(2025,  6, 28), date(2025,  8, 17)),
 ]
 
-#Création d'un set contenant tous les jours de vacances scolaires à paritr de la liste SCHOOL_HOLIDAYS
 
-def build_school_set(periods):
+def build_school_set(periods: list) -> set:
     days = set()
     for start, end in periods:
         d = start
@@ -79,45 +101,57 @@ def build_school_set(periods):
             d += timedelta(days=1)
     return days
 
-#Génération des timestamps
 
-def generate_calendar(
-    start = datetime(2022, 10,  1,  0,  0, 0, tzinfo=timezone.utc),
-    end   = datetime(2025,  9, 30, 23, 45, 0, tzinfo=timezone.utc),
-):
+# ── Generation ────────────────────────────────────────────────────────────────
+def generate_calendar() -> pl.DataFrame:
+    print("Generation de la grille 15min UTC...")
+
     df = pl.DataFrame({
         "timestamp": pl.datetime_range(
-            start, end, interval="15m",
-            time_unit="us", time_zone="UTC", eager=True
+            PERIOD_START, PERIOD_END,
+            interval=f"{TARGET_STEP_MIN}m",
+            time_unit="us", time_zone="UTC", eager=True,
         )
     })
+    print(f"  {df.shape[0]:,} lignes")
 
-#Ajout des colonnes
+    # ── Heure locale (Europe/Zurich) ──────────────────────────────────────
+    df = df.with_columns(
+        pl.col("timestamp")
+          .dt.convert_time_zone("Europe/Zurich")
+          .alias("_ts_local")
+    )
+
+    # ── Composantes temporelles basees sur l'heure locale ─────────────────
     df = df.with_columns([
-        pl.col("timestamp").dt.hour().alias("hour"),
-        pl.col("timestamp").dt.weekday().alias("day_of_week"),
-        pl.col("timestamp").dt.month().alias("month"),
-        pl.col("timestamp").dt.ordinal_day().alias("_doy"),
-        pl.col("timestamp").dt.date().alias("_date"),
+        pl.col("_ts_local").dt.hour().alias("hour"),
+        pl.col("_ts_local").dt.weekday().alias("day_of_week"),
+        pl.col("_ts_local").dt.month().alias("month"),
+        pl.col("_ts_local").dt.ordinal_day().alias("_doy"),
+        pl.col("_ts_local").dt.date().alias("_date"),
     ])
 
-#Génération des set de jours spéciaux
+    # ── Jours feries et vacances scolaires ────────────────────────────────
     all_holidays = set()
-    for y in range(start.year, end.year + 1):
+    for y in range(2022, 2026):
         all_holidays |= get_holidays_valais(y)
     school_set = build_school_set(SCHOOL_HOLIDAYS)
 
-    holiday_list = [1 if d in all_holidays else 0 for d in df["_date"].to_list()]
-    school_list  = [1 if d in school_set  else 0 for d in df["_date"].to_list()]
+    print(f"  Jours feries : {len(all_holidays)}")
+    print(f"  Jours vacances : {len(school_set)}")
 
-#Ajout de colonnes de jours spéciaux
+    date_list     = df["_date"].to_list()
+    holiday_list  = [1 if d in all_holidays else 0 for d in date_list]
+    school_list   = [1 if d in school_set   else 0 for d in date_list]
+    weekend_list = [1 if dow >= 6 else 0 for dow in df["day_of_week"].to_list()]
+
     df = df.with_columns([
-        pl.Series("is_weekend",        [1 if dow >= 5 else 0 for dow in df["day_of_week"].to_list()], dtype=pl.Int8),
-        pl.Series("is_holiday",        holiday_list, dtype=pl.Int8),
-        pl.Series("is_school_holiday", school_list,  dtype=pl.Int8),
+        pl.Series("is_weekend",       weekend_list, dtype=pl.Int8),
+        pl.Series("is_holiday",       holiday_list, dtype=pl.Int8),
+        pl.Series("is_school_holiday",school_list,  dtype=pl.Int8),
     ])
 
-#Ajout de colonnes à signaux sin et cos (heure, mois et semaine)
+    # ── Encodages cycliques ───────────────────────────────────────────────
     tau = 2 * math.pi
     df = df.with_columns([
         (pl.col("hour").cast(pl.Float64) * (tau / 24)).sin().alias("hour_sin"),
@@ -127,29 +161,51 @@ def generate_calendar(
         (pl.col("day_of_week").cast(pl.Float64) * (tau / 7)).sin().alias("day_of_week_sin"),
         (pl.col("day_of_week").cast(pl.Float64) * (tau / 7)).cos().alias("day_of_week_cos"),
     ])
-#Calcul des jours dans l'années 
+
+    # Encodage cyclique jour de l'annee (avec gestion annees bissextiles)
     doy_vals  = df["_doy"].to_list()
-    year_vals = df["timestamp"].dt.year().to_list()
+    year_vals = df["_ts_local"].dt.year().to_list()
     doy_sin, doy_cos = [], []
     for doy, yr in zip(doy_vals, year_vals):
         diy = 366 if (yr % 4 == 0 and (yr % 100 != 0 or yr % 400 == 0)) else 365
         doy_sin.append(math.sin(tau * doy / diy))
         doy_cos.append(math.cos(tau * doy / diy))
 
-#Ajout de colonnes à signaux sin et cos (jour dans l'année)
     df = df.with_columns([
         pl.Series("day_of_year_sin", doy_sin, dtype=pl.Float64),
         pl.Series("day_of_year_cos", doy_cos, dtype=pl.Float64),
     ])
 
-#Suppression des colonnes de construction
-    df = df.drop(["_doy", "_date"])
+    # ── Nettoyage colonnes intermediaires ─────────────────────────────────
+    df = df.drop(["_ts_local", "_doy", "_date"])
 
     return df
 
-#Lancement du code
+
 if __name__ == "__main__":
+    DATA_DIR.mkdir(exist_ok=True)
+
     df = generate_calendar()
-    path = OUTPUT_DIR / "calendar.parquet"
-    df.write_parquet(path)
-    print(f"Exporte -> {path}  ({df.shape[0]:,} lignes x {df.shape[1]} col)")
+
+    print(f"\nApercu :")
+    print(df.head(8))
+
+    print(f"\nVerification jours feries detectes :")
+    hol = (df.filter(pl.col("is_holiday") == 1)
+             .with_columns(pl.col("timestamp").dt.convert_time_zone("Europe/Zurich")
+                             .dt.date().alias("date"))
+             ["date"].unique().sort().to_list())
+    for d in hol:
+        print(f"  {d}")
+
+    print(f"\nVerification vacances scolaires : "
+          f"{df.filter(pl.col('is_school_holiday') == 1).with_columns(pl.col('timestamp').dt.convert_time_zone('Europe/Zurich').dt.date().alias('date'))['date'].n_unique()} jours distincts")
+
+    print(f"\nRepartition is_weekend :")
+    print(df.group_by("is_weekend").agg(pl.len().alias("count")).sort("is_weekend"))
+
+    FILE_CALENDAR.parent.mkdir(exist_ok=True)
+    df.write_parquet(FILE_CALENDAR)
+    size_mb = FILE_CALENDAR.stat().st_size / 1024 / 1024
+    print(f"\n-> {FILE_CALENDAR.name}  "
+          f"({df.shape[0]:,} lignes x {df.shape[1]} col, {size_mb:.1f} MB)")
