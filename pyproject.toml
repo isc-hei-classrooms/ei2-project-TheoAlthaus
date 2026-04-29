@@ -9,6 +9,7 @@ dependencies = [
     "influxdb-client>=1.50.0",
     "lightgbm>=4.6.0",
     "marimo>=0.19.11",
+    "optuna>=4.8.0",
     "pandas>=3.0.0",
     "plotly>=6.6.0",
     "polars>=1.29.0",

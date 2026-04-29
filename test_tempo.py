@@ -1,9 +1,12 @@
 import polars as pl
-from config import DATA_DIR, FILE_OIKEN_CLEAN
+from pathlib import Path
+from config import FILE_METEO_HIST_CLEAN, DATA_DIR
 
-df = pl.read_parquet(FILE_OIKEN_CLEAN)
-pv_cols = ["pv_central_valais", "pv_sierre", "pv_sion"]
-for col in pv_cols:
-    if col in df.columns:
-        n_null = df[col].is_null().sum()
-        print(f"{col:<25} min={df[col].min():.3f}  max={df[col].max():.3f}  NaN={n_null:,}")
+GOLDEN_DIR = DATA_DIR.parent / "golden_data"
+
+meteo_hist_train = pl.read_parquet(FILE_METEO_HIST_CLEAN("sion"))
+meteo_hist       = pl.read_parquet(GOLDEN_DIR / "meteo_sion_hist_golden_clean.parquet")
+
+print("Train cols :", meteo_hist_train.columns)
+print("Golden cols:", meteo_hist.columns)
+print("Communes   :", [c for c in meteo_hist_train.columns if c in meteo_hist.columns])

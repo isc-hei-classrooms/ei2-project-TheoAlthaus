@@ -26,7 +26,7 @@ import polars as pl
 from config import DATA_DIR, FILE_CALENDAR, TARGET_STEP_MIN
 
 PERIOD_START = pl.datetime(2022, 10,  1,  0, 15, 0, time_unit="us", time_zone="UTC")
-PERIOD_END   = pl.datetime(2025,  9, 30,  0,  0, 0, time_unit="us", time_zone="UTC")
+PERIOD_END = pl.datetime(2026, 4, 22, 0, 0, 0, time_unit="us", time_zone="UTC")
 
 TZ_LOCAL = ZoneInfo("Europe/Zurich")
 
@@ -89,6 +89,10 @@ SCHOOL_HOLIDAYS = [
     (date(2025,  2, 15), date(2025,  2, 23)),
     (date(2025,  4,  5), date(2025,  4, 20)),
     (date(2025,  6, 28), date(2025,  8, 17)),
+    (date(2025,  9, 27), date(2025, 10, 12)),
+    (date(2025, 12, 20), date(2026,  1,  4)),
+    (date(2026,  2, 14), date(2026,  2, 22)),
+    (date(2026,  3, 28), date(2026,  4, 12)),
 ]
 
 
@@ -133,7 +137,7 @@ def generate_calendar() -> pl.DataFrame:
 
     # ── Jours feries et vacances scolaires ────────────────────────────────
     all_holidays = set()
-    for y in range(2022, 2026):
+    for y in range(2022, 2027):
         all_holidays |= get_holidays_valais(y)
     school_set = build_school_set(SCHOOL_HOLIDAYS)
 
