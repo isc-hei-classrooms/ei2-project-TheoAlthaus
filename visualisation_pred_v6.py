@@ -109,7 +109,6 @@ if __name__ == "__main__":
                          else None,
         })
 
-    # Periode buguee Oiken
     bug_dates = [
         d for d in all_dates
         if d >= "2025-09-13" and d <= "2025-09-17"
@@ -601,9 +600,7 @@ function renderGlobalStats() {{
       <div style="margin-bottom:10px;padding-bottom:10px;
                   border-bottom:1px solid #21262D">
         <div style="font-size:11px;color:{SUBTEXT};margin-bottom:6px;
-                    text-transform:uppercase">
-          ${{split}} (${{dates_s.length}} jours)
-        </div>
+                    text-transform:uppercase">${{split}}</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
           <div class="metric">
             <div class="metric-val">${{maeM.toFixed(4)}}</div>
